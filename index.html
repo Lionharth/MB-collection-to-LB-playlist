@@ -4,16 +4,15 @@
 <meta charset="utf-8" />
 <title>MB → ListenBrainz</title>
 <style>
-  body { font-family: system-ui, sans-serif; background:#0f0f14; color:#eee; max-width:900px; margin:28px auto; padding:18px; }
-  h1 { margin:0 0 12px; }
+  body { font-family: system-ui, sans-serif; background:#0f0f14; color:#eee; max-width:900px; margin:28px auto; padding:18px;}
+  h1{margin:0 0 12px}
   label{display:block; margin-top:8px; color:#ccc}
   input, button { width:100%; padding:10px; margin:8px 0; background:#1c1c26; color:#fff; border:1px solid #333; border-radius:8px; }
-  button { background:#6b5cff; border:none; font-weight:600; cursor:pointer; }
-  button[disabled] { background:#444; cursor:default; }
-  .row { display:flex; gap:10px; }
-  .row > * { flex:1; }
-  pre { background:#14141c; padding:12px; border-radius:8px; white-space:pre-wrap; font-size:13px; max-height:50vh; overflow:auto; }
-  small { color:#aaa; }
+  .row{display:flex; gap:10px}
+  .row> *{flex:1}
+  button{background:#6b5cff;border:none;font-weight:600;cursor:pointer}
+  button[disabled]{background:#444;cursor:default}
+  pre{background:#14141c;padding:12px;border-radius:8px;white-space:pre-wrap;font-size:13px;max-height:50vh;overflow:auto}
 </style>
 </head>
 <body>
@@ -25,304 +24,230 @@
   <label>MusicBrainz collection ID (public)</label>
   <input id="mbCollection" placeholder="e.g. 4d6c8c24-xxxx-xxxx-xxxx-xxxxxxxx" />
 
-  <label>Playlist base name</label>
+  <label>Playlist name</label>
   <input id="playlistName" value="My albums" />
 
   <div class="row">
     <div>
-      <label>Chunk size (tracks per playlist)</label>
-      <input id="chunkSize" type="number" value="300" />
+      <label>MB delay (ms)</label>
+      <input id="mbDelay" type="number" value="1500" />
     </div>
     <div>
-      <label>MB delay (ms)</label>
-      <input id="mbDelay" type="number" value="2000" />
+      <label>Add chunk size</label>
+      <input id="addChunk" type="number" value="100" />
     </div>
   </div>
 
   <div class="row">
-    <button id="runBtn">Start import</button>
+    <button id="runBtn">Create + Append</button>
     <button id="retrySkippedBtn" disabled>Retry skipped</button>
   </div>
 
-  <small>Skipped releases are stored locally (browser) so you can retry them later. Increase MB delay if many skips occur.</small>
+  <small>If the server rejects a chunk due to size, lower Add chunk size (e.g. 50). The app will create a playlist and append tracks in chunks.</small>
   <pre id="log"></pre>
 
 <script>
-/* ===== CONFIG ===== */
+/* CONFIG */
 const USER_AGENT = "MB-LB-Playlist/1.0 (example@example.com)";
 const PLAYLIST_DELAY_MS = 600;
-const RELEASE_RETRY_ATTEMPTS = 4;       // attempts per release
-const RELEASE_RETRY_BASE_MS = 1000;     // base backoff
-/* ================== */
+const CREATE_RETRIES = 3;
+const ADD_RETRIES = 3;
 
 const logBox = document.getElementById("log");
-const log = msg => { logBox.textContent += msg + "\n"; logBox.scrollTop = logBox.scrollHeight; };
+const log = m => { logBox.textContent += m + "\n"; logBox.scrollTop = logBox.scrollHeight; };
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 
-/* In-memory mappings and persistent skipped list */
-let releasesById = {};    // id => release object (from collection)
-let fetchedCache = {};    // releaseId => array of recordings (so we don't re-fetch)
-let skippedSet = new Set(); // releaseIds that permanently failed this run (also persisted per collection)
-
-/* Utilities for localStorage skipped persistence */
-function saveSkipped(collectionId) {
-  if (!collectionId) return;
-  localStorage.setItem('mb_skipped_' + collectionId, JSON.stringify(Array.from(skippedSet)));
-}
-function loadSkipped(collectionId) {
-  skippedSet.clear();
-  const raw = localStorage.getItem('mb_skipped_' + collectionId);
-  if (!raw) return;
-  try {
-    const arr = JSON.parse(raw);
-    for (const id of arr) skippedSet.add(id);
-  } catch(e) {}
-}
-
-/* lightweight fetch wrapper with UA */
+/* light UA fetch */
 async function fetchJsonWithUA(url) {
   const res = await fetch(url, { headers: { "User-Agent": USER_AGENT } });
   if (!res.ok) {
-    const txt = await res.text().catch(()=>'');
-    throw new Error(`HTTP ${res.status} ${txt ? '- ' + txt : ''}`);
+    const text = await res.text().catch(()=>"");
+    throw new Error(`HTTP ${res.status} ${text || ""}`);
   }
   return res.json();
 }
 
-/* fetch all releases (paginated) */
+/* Fetch all releases in the collection (paginated) */
 async function fetchAllReleases(collectionId, mbDelay) {
-  let offset = 0;
-  const limit = 100;
-  const out = [];
+  let offset = 0, limit = 100, out = [];
   while (true) {
     const url = `https://musicbrainz.org/ws/2/collection/${collectionId}/releases?fmt=json&limit=${limit}&offset=${offset}`;
     const data = await fetchJsonWithUA(url);
     if (!data.releases || data.releases.length === 0) break;
-    for (const r of data.releases) {
-      out.push(r);
-      releasesById[r.id] = r;
-    }
+    out.push(...data.releases);
     offset += limit;
     await sleep(mbDelay);
   }
   return out;
 }
 
-/* robust fetch for a single release's recordings with retries + jitter */
-async function fetchRecordingsWithRetries(release, mbDelay) {
-  // if cached, return immediately
-  if (fetchedCache[release.id]) return fetchedCache[release.id];
-
-  for (let attempt = 1; attempt <= RELEASE_RETRY_ATTEMPTS; attempt++) {
-    try {
-      const url = `https://musicbrainz.org/ws/2/release/${release.id}?inc=recordings&fmt=json`;
-      const data = await fetchJsonWithUA(url);
-      const recs = [];
-      for (const m of data.media || []) {
-        for (const t of m.tracks || []) {
-          if (t.recording?.id) recs.push({ identifier: `https://musicbrainz.org/recording/${t.recording.id}` });
-        }
-      }
-      // cache success
-      fetchedCache[release.id] = recs;
-      return recs;
-    } catch (err) {
-      const jitter = Math.floor(Math.random() * 300);
-      const backoff = RELEASE_RETRY_BASE_MS * attempt + jitter;
-      log(`  attempt ${attempt} failed for "${release.title}" (${release.id}): ${err.message}. backoff ${backoff}ms`);
-      // If last attempt, we'll return empty and mark skipped in caller
-      if (attempt < RELEASE_RETRY_ATTEMPTS) await sleep(backoff);
+/* Fetch recordings from a release (inc=recordings) */
+async function fetchRecordingsFromRelease(release, mbDelay) {
+  const url = `https://musicbrainz.org/ws/2/release/${release.id}?inc=recordings&fmt=json`;
+  const data = await fetchJsonWithUA(url);
+  const recs = [];
+  for (const medium of data.media || []) {
+    for (const t of medium.tracks || []) {
+      if (t.recording?.id) recs.push({ identifier: `https://musicbrainz.org/recording/${t.recording.id}` });
     }
   }
-
-  // failed after retries
-  return null; // signal permanent failure for this run
+  await sleep(mbDelay);
+  return recs;
 }
 
-/* Create JSPF playlist (same as before) */
-async function createListenBrainzPlaylistJSPF(token, title, recordings) {
+/* Create an empty playlist (JSPF with title + extension.public) and return playlist_mbid from server response */
+async function createEmptyPlaylist(token, title) {
   const jspf = {
     playlist: {
       title,
-      track: recordings.map(r => ({ identifier: [ r.identifier ] })),
       extension: {
         "https://musicbrainz.org/doc/jspf#playlist": { public: true }
       }
     }
   };
 
-  const res = await fetch("https://api.listenbrainz.org/1/playlist/create", {
-    method: "POST",
-    headers: {
-      "Authorization": `Token ${token}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify(jspf)
-  });
+  let attempt = 0;
+  while (++attempt <= CREATE_RETRIES) {
+    try {
+      const res = await fetch("https://api.listenbrainz.org/1/playlist/create", {
+        method: "POST",
+        headers: {
+          "Authorization": `Token ${token}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(jspf)
+      });
+      const txt = await res.text();
+      let parsed = null;
+      try { parsed = JSON.parse(txt); } catch(e){ parsed = null; }
 
-  const text = await res.text().catch(()=>'');
+      if (!res.ok) throw new Error(`LB ${res.status}: ${txt}`);
 
-  if (!res.ok) throw new Error(`LB ${res.status}: ${text || 'no details'}`);
-  try { return JSON.parse(text); } catch { return text; }
+      // common implementations return 'playlist_mbid' in the JSON
+      const mbid = parsed && (parsed.playlist_mbid || parsed.mbid || parsed.id || parsed.playlist_id || parsed.playlistMbid);
+      if (!mbid) {
+        // if server returned something else, show it
+        log("Create returned: " + JSON.stringify(parsed || txt));
+        throw new Error("Could not find playlist MBID in create response");
+      }
+      return mbid;
+    } catch (err) {
+      log(`⚠ Create attempt ${attempt} failed: ${err.message}`);
+      if (attempt < CREATE_RETRIES) await sleep(400 * attempt);
+      else throw err;
+    }
+  }
 }
 
-/* chunk helper */
+/* Append a chunk of recordings to playlist via /item/add (JSPF body). offset optional; if omitted, appends to end */
+async function appendChunkToPlaylist(token, playlist_mbid, recordingsChunk, offset) {
+  // Build JSPF: playlist.track[].identifier is an array
+  const jspf = {
+    playlist: {
+      track: recordingsChunk.map(r => ({ identifier: [ r.identifier ] })),
+      extension: {
+        "https://musicbrainz.org/doc/jspf#playlist": { public: true }
+      }
+    }
+  };
+
+  // build URL (include offset if given)
+  const url = offset === undefined
+    ? `https://api.listenbrainz.org/1/playlist/${playlist_mbid}/item/add`
+    : `https://api.listenbrainz.org/1/playlist/${playlist_mbid}/item/add/${offset}`;
+
+  let attempt = 0;
+  while (++attempt <= ADD_RETRIES) {
+    try {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: {
+          "Authorization": `Token ${token}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(jspf)
+      });
+      const txt = await res.text();
+      if (!res.ok) throw new Error(`LB ${res.status}: ${txt}`);
+      // success
+      return txt ? JSON.parse(txt) : { ok: true };
+    } catch (err) {
+      log(`⚠ Append attempt ${attempt} failed: ${err.message}`);
+      if (attempt < ADD_RETRIES) {
+        await sleep(300 * attempt + Math.floor(Math.random()*200));
+        log(`  retrying append...`);
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
+/* chunk utility */
 function chunkArray(arr, n) {
   const out = [];
   for (let i=0;i<arr.length;i+=n) out.push(arr.slice(i,i+n));
   return out;
 }
 
-/* Main import flow */
+/* MAIN FLOW */
 document.getElementById("runBtn").onclick = async function () {
   const btn = this;
   btn.disabled = true;
   logBox.textContent = "";
-  fetchedCache = {};
-  releasesById = {};
-  skippedSet.clear();
 
   try {
     const token = document.getElementById("lbToken").value.trim();
     const collectionId = document.getElementById("mbCollection").value.trim();
-    const baseName = document.getElementById("playlistName").value.trim() || "Imported Collection";
-    const chunkSize = parseInt(document.getElementById("chunkSize").value,10) || 200;
-    const mbDelay = parseInt(document.getElementById("mbDelay").value,10) || 1100;
+    const playlistName = document.getElementById("playlistName").value.trim() || "Imported Playlist";
+    const mbDelay = parseInt(document.getElementById("mbDelay").value, 10) || 1100;
+    const addChunk = parseInt(document.getElementById("addChunk").value, 10) || 100;
 
-    if (!token || !collectionId) { log("Missing token or collection ID."); btn.disabled=false; return; }
-
-    // load previously skipped releases for this collection
-    loadSkipped(collectionId);
-    if (skippedSet.size) {
-      log(`Loaded ${skippedSet.size} previously skipped release(s) from this browser for this collection.`);
-      document.getElementById("retrySkippedBtn").disabled = false;
-    }
+    if (!token || !collectionId) { log("Missing LB token or MB collection ID"); btn.disabled=false; return; }
 
     log("Fetching MusicBrainz collection...");
     const releases = await fetchAllReleases(collectionId, mbDelay);
     log(`Found ${releases.length} releases.`);
 
+    // expand to recordings (respecting MB delay)
     let recordings = [];
-    log("Expanding albums → tracks (with retries)...");
-    for (const rel of releases) {
-      log(`• ${rel.title}`);
-      const recs = await fetchRecordingsWithRetries(rel, mbDelay);
-      if (recs === null) {
-        log(`⚠ Skipped: ${rel.title}`);
-        skippedSet.add(rel.id);
-        saveSkipped(collectionId);
-      } else {
+    log("Expanding albums → tracks (polite, can be slow)...");
+    for (const r of releases) {
+      try {
+        log(`• ${r.title}`);
+        const recs = await fetchRecordingsFromRelease(r, mbDelay);
         recordings.push(...recs);
+      } catch (err) {
+        log(`⚠ Skipped: ${r.title} — ${err.message}`);
       }
-      await sleep(mbDelay); // keep polite to MB between releases
     }
 
     // dedupe
     const seen = new Set();
     const deduped = [];
-    for (const r of recordings) {
-      if (!r?.identifier) continue;
-      if (!seen.has(r.identifier)) { seen.add(r.identifier); deduped.push(r); }
+    for (const rec of recordings) {
+      if (!rec?.identifier) continue;
+      if (!seen.has(rec.identifier)) { seen.add(rec.identifier); deduped.push(rec); }
     }
-
     log(`Total recordings after dedupe: ${deduped.length}`);
-    if (deduped.length === 0) throw new Error("No recordings found to create a playlist.");
+    if (deduped.length === 0) { log("No recordings found."); btn.disabled=false; return; }
 
-    const chunks = chunkArray(deduped, chunkSize);
-    log(`Will create ${chunks.length} playlist(s).`);
+    // 1) create empty playlist and retrieve playlist_mbid
+    log("Creating empty playlist...");
+    const playlist_mbid = await createEmptyPlaylist(token, playlistName);
+    log(`Playlist created, MBID: ${playlist_mbid}`);
 
+    // 2) append in chunks
+    const chunks = chunkArray(deduped, addChunk);
+    log(`Appending ${deduped.length} recordings in ${chunks.length} chunk(s) (chunk size ${addChunk})...`);
     for (let i=0;i<chunks.length;i++) {
-      const name = chunks.length === 1 ? baseName : `${baseName} (part ${i+1})`;
-      log(`Creating playlist: "${name}" with ${chunks[i].length} tracks...`);
-      try {
-        const res = await createListenBrainzPlaylistJSPF(token, name, chunks[i]);
-        log(`✅ Created: "${name}" — server response:`);
-        log(JSON.stringify(res, null, 2));
-      } catch (err) {
-        log(`❌ Failed to create "${name}": ${err.message}`);
-      }
+      log(`Appending chunk ${i+1}/${chunks.length} (${chunks[i].length} tracks) ...`);
+      await appendChunkToPlaylist(token, playlist_mbid, chunks[i]); // appends to end by default
+      log(`✅ Appended chunk ${i+1}`);
       await sleep(PLAYLIST_DELAY_MS);
     }
 
-    document.getElementById("retrySkippedBtn").disabled = skippedSet.size === 0;
-    log("Import finished.");
-  } catch (err) {
-    log("ERROR:");
-    log(err.message || err);
-  } finally {
-    btn.disabled = false;
-  }
-};
-
-/* Retry skipped releases: tries only the skipped ones and appends found recordings as new playlist(s) */
-document.getElementById("retrySkippedBtn").onclick = async function () {
-  const btn = this;
-  btn.disabled = true;
-  logBox.textContent += "\n--- RETRYING SKIPPED RELEASES ---\n";
-  try {
-    const token = document.getElementById("lbToken").value.trim();
-    const collectionId = document.getElementById("mbCollection").value.trim();
-    const baseName = document.getElementById("playlistName").value.trim() || "Imported Collection";
-    const chunkSize = parseInt(document.getElementById("chunkSize").value,10) || 200;
-    const mbDelay = parseInt(document.getElementById("mbDelay").value,10) || 1100;
-
-    if (!token || !collectionId) { log("Missing token/collection ID."); btn.disabled=false; return; }
-
-    loadSkipped(collectionId); // refresh
-    if (skippedSet.size === 0) { log("No skipped releases to retry."); btn.disabled=false; return; }
-
-    const toRetry = Array.from(skippedSet);
-    log(`Retrying ${toRetry.length} skipped release(s)...`);
-    const recoveredRecordings = [];
-
-    for (const rid of toRetry) {
-      const rel = releasesById[rid];
-      if (!rel) {
-        log(`⚠ Can't find release metadata in memory for ${rid}; skipping.`);
-        continue;
-      }
-      log(`Retrying: ${rel.title}`);
-      const recs = await fetchRecordingsWithRetries(rel, mbDelay);
-      if (recs === null) {
-        log(`Still failing: ${rel.title}`);
-      } else {
-        log(`Recovered: ${rel.title} (${recs.length} tracks)`);
-        // remove from skipped set and add to recovered
-        skippedSet.delete(rid);
-        recoveredRecordings.push(...recs);
-        // persist removal
-        saveSkipped(collectionId);
-      }
-      await sleep(mbDelay);
-    }
-
-    if (recoveredRecordings.length) {
-      // dedupe against cached recordings
-      const seen = new Set();
-      const deduped = [];
-      for (const r of recoveredRecordings) {
-        if (!r?.identifier) continue;
-        if (!seen.has(r.identifier)) { seen.add(r.identifier); deduped.push(r); }
-      }
-
-      log(`Creating playlists for ${deduped.length} recovered tracks...`);
-      const chunks = chunkArray(deduped, chunkSize);
-      for (let i=0;i<chunks.length;i++) {
-        const name = chunks.length === 1 ? `${baseName} (recovered)` : `${baseName} (recovered part ${i+1})`;
-        try {
-          const res = await createListenBrainzPlaylistJSPF(token, name, chunks[i]);
-          log(`✅ Created recovered playlist: "${name}"`);
-        } catch (err) {
-          log(`❌ Failed to create recovered playlist "${name}": ${err.message}`);
-        }
-        await sleep(PLAYLIST_DELAY_MS);
-      }
-    } else {
-      log("No recordings recovered from retries.");
-    }
-
-    document.getElementById("retrySkippedBtn").disabled = skippedSet.size === 0;
-    log("Retry process finished.");
+    log("All chunks appended. Done.");
   } catch (err) {
     log("ERROR:");
     log(err.message || err);
